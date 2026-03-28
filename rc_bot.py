@@ -1,200 +1,182 @@
+﻿import sys
 import os
-import re
-import logging
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
-import pdfplumber
-import pytesseract
-pytesseract.pytesseract.pytesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-from PIL import Image
-from io import BytesIO
 
-# Setup
+# Set Tesseract path FIRST
+os.environ["PATH"] += r";C:\Program Files\Tesseract-OCR"
+
+import pytesseract
+pytesseract.pytesseract.pytesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+import logging, tempfile, re
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from PIL import Image
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = "8042412126:AAEtcZWM52JnYcHvPHDfdRgj0VWh3ypeMgw" # Get from @BotFather on Telegram
+TOKEN = "8042412126:AAEtcZWM52JnYcHvPHDfdRgj0VWh3ypeMgw"
+TEMP_DIR = tempfile.gettempdir()
 
-def extract_from_pdf(file_path):
-    """Extract text from PDF"""
+def pdf_to_text_ocr(pdf_path):
     text = ""
     try:
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() or ""
+        import fitz
+        doc = fitz.open(pdf_path)
+        print(f"📄 PDF has {len(doc)} pages")
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            mat = fitz.Matrix(3, 3)
+            pix = page.get_pixmap(matrix=mat)
+            
+            img_path = os.path.join(TEMP_DIR, f"page_{page_num}.png")
+            pix.save(img_path)
+            
+            img = Image.open(img_path)
+            page_text = pytesseract.image_to_string(img)
+            print(f"✓ Page {page_num}: {len(page_text)} chars")
+            
+            text += page_text + "\n"
+            os.remove(img_path)
+        
+        doc.close()
     except Exception as e:
-        logger.error(f"PDF extraction error: {e}")
+        print(f"❌ PDF Error: {e}")
+        return ""
+    
+    print(f"✅ Total: {len(text)} chars extracted")
     return text
 
-def extract_from_image(image_path):
-    """Extract text from image using OCR"""
+def extract_image_text(img_path):
     try:
-        img = Image.open(image_path)
-        text = pytesseract.image_to_string(img)
-        return text
+        img = Image.open(img_path)
+        return pytesseract.image_to_string(img)
     except Exception as e:
-        logger.error(f"Image OCR error: {e}")
+        print(f"Image error: {e}")
         return ""
 
 def parse_rc(text):
-    """Parse rate confirmation data"""
+    print(f"\n=== PARSING ===")
+    print(f"Length: {len(text)} chars")
+    
     data = {
-        "pro_number": "N/A",
-        "carrier": "N/A",
-        "contact": "N/A",
-        "equipment": "N/A",
-        "commodity": "N/A",
-        "weight": "N/A",
-        "miles": "N/A",
-        "total_rate": "N/A",
-        "pickup": "N/A",
-        "pickup_date": "N/A",
-        "delivery": "N/A",
-        "delivery_date": "N/A",
-        "temp": "N/A",
-        "special": "N/A"
+        "pro": "N/A", "carrier": "UZB", "contact": "N/A", "phone": "N/A",
+        "equip": "N/A", "commodity": "N/A", "weight": "N/A", "pallets": "N/A",
+        "miles": "N/A", "rate": "N/A", "has_rate": True, "pickup_loc": "N/A",
+        "pickup_addr": "N/A", "pickup_date": "N/A", "pickup_time": "N/A",
+        "delivery_loc": "N/A", "delivery_addr": "N/A", "delivery_date": "N/A",
+        "delivery_time": "N/A", "temp": "N/A", "reefer": False,
+        "instructions": [], "broker": "N/A",
     }
     
-    # Extract PRO/Load number
-    pro_match = re.search(r'PRO\s*#\s*(\d+)', text)
-    if pro_match:
-        data["pro_number"] = pro_match.group(1)
+    m = re.search(r"PRO\s*#\s*(\d{5,})|Load\s*#\s*(\d{5,})", text, re.I)
+    if m: 
+        data["pro"] = m.group(1) or m.group(2)
+        print(f"✓ PRO: {data['pro']}")
     
-    # Extract carrier name
-    carrier_match = re.search(r'UZB\s*FREIGHT\s*INC', text)
-    if carrier_match:
-        data["carrier"] = "UZB FREIGHT INC"
+    if "ALLEN" in text.upper(): 
+        data["broker"] = "ALLEN LUND"
+    elif "PROPEL" in text.upper(): 
+        data["broker"] = "PROPEL"
+        print(f"✓ Broker: PROPEL")
     
-    # Extract contact person
-    contact_match = re.search(r'(JOE\s+HERNANDEZ|TED)', text)
-    if contact_match:
-        data["contact"] = contact_match.group(1)
+    m = re.findall(r"\(?(\d{3})\)?[\s.-]?(\d{3})[\s.-]?(\d{4})", text)
+    if m: 
+        data["phone"] = f"({m[0][0]}) {m[0][1]}-{m[0][2]}"
+        print(f"✓ Phone: {data['phone']}")
     
-    # Extract equipment
-    equip_match = re.search(r"(?:53['\"]?\s*)?(?:REEFER|REFRIGERATED|DRY|FLATBED)", text)
-    if equip_match:
-        data["equipment"] = equip_match.group(0).strip()
+    if re.search(r"REEFER", text, re.I):
+        data["reefer"] = True
+        data["equip"] = "53' REEFER"
+        print(f"✓ REEFER")
     
-    # Extract commodity
-    commodity_match = re.search(r'(?:FROZEN\s+FOOD|BRUSSELS\s+SPROUTS|Description:\s+([^,\n]+))', text)
-    if commodity_match:
-        data["commodity"] = commodity_match.group(1) if commodity_match.lastindex else commodity_match.group(0)
+    if "FROZEN" in text.upper(): 
+        data["commodity"] = "FROZEN FOOD"
+        print(f"✓ Commodity: FROZEN")
     
-    # Extract weight
-    weight_match = re.search(r'Weight:?\s*(\d+)\s*(?:lbs?|kg)?', text, re.IGNORECASE)
-    if weight_match:
-        data["weight"] = weight_match.group(1)
+    m = re.search(r"Weight\s*[:\s=]+(\d+)", text, re.I)
+    if m: 
+        data["weight"] = f"{m.group(1)} lbs"
+        print(f"✓ Weight: {data['weight']}")
     
-    # Extract miles
-    miles_match = re.search(r'Miles:?\s*(\d+)', text)
-    if miles_match:
-        data["miles"] = miles_match.group(1)
+    m = re.search(r"PICK.*?\n\s*([A-Z\s]+?)\n\s*(\d+.*?(?:TX|CA|WA|AZ|NJ|IL).*?\d{5}).*?(\d{1,2}/\d{1,2}/\d{2,4})", text, re.I | re.DOTALL)
+    if m:
+        data["pickup_loc"] = m.group(1).strip()[:35]
+        data["pickup_addr"] = m.group(2).strip()[:55]
+        data["pickup_date"] = m.group(3)
+        print(f"✓ Pickup: {data['pickup_loc']}")
     
-    # Extract total rate
-    rate_match = re.search(r'TOTAL\s*RATE\s*\$?([\d,]+\.?\d*)', text)
-    if rate_match:
-        data["total_rate"] = rate_match.group(1)
-    
-    # Extract temperature
-    temp_match = re.search(r'TEMP(?:ERATURE)?.*?(-?\d+)\s*(?:TO|and)\s*(-?\d+)\s*[F°]', text)
-    if temp_match:
-        data["temp"] = f"{temp_match.group(1)} to {temp_match.group(2)}°F"
-    
-    # Extract pickup info
-    pickup_match = re.search(r'PICK.*?\n\s*([A-Z\s]+)\n.*?(\d{1,2}/\d{1,2}/\d{2,4})', text)
-    if pickup_match:
-        data["pickup"] = pickup_match.group(1).strip()
-        data["pickup_date"] = pickup_match.group(2)
-    
-    # Extract delivery info
-    delivery_match = re.search(r'(?:STOP|DELIVERY).*?\n\s*([A-Z\s]+)\n.*?(\d{1,2}/\d{1,2}/\d{2,4})', text)
-    if delivery_match:
-        data["delivery"] = delivery_match.group(1).strip()
-        data["delivery_date"] = delivery_match.group(2)
+    m = re.search(r"(?:STOP|FOODCO).*?\n\s*([A-Z\s]+?)\n\s*(\d+.*?(?:TX|CA|WA|AZ|NJ|IL).*?\d{5}).*?(\d{1,2}/\d{1,2}/\d{2,4})", text, re.I | re.DOTALL)
+    if m:
+        data["delivery_loc"] = m.group(1).strip()[:35]
+        data["delivery_addr"] = m.group(2).strip()[:55]
+        data["delivery_date"] = m.group(3)
+        print(f"✓ Delivery: {data['delivery_loc']}")
     
     return data
 
-def format_message(data):
-    """Format extracted data for Telegram"""
-    msg = f"""
-📋 **RATE CONFIRMATION EXTRACTED**
+def format_msg(d):
+    return f"📋 **{d['pro']}**\n📦 {d['commodity']}\n⚖️ {d['weight']}\n📤 {d['pickup_loc']} → 📥 {d['delivery_loc']}\n💰 ${d['rate'] if d['has_rate'] else 'TBD'}"
 
-**Load Info:**
-🔖 PRO/Load #: `{data['pro_number']}`
-🚛 Carrier: {data['carrier']}
-👤 Contact: {data['contact']}
+async def rate_response(update, context):
+    q = update.callback_query
+    await q.answer()
+    if "d" in context.user_data:
+        if q.data == "no": context.user_data["d"]["has_rate"] = False
+        await q.edit_message_text(format_msg(context.user_data["d"]), parse_mode="Markdown")
 
-**Equipment & Cargo:**
-📦 Equipment: {data['equipment']}
-🏷️ Commodity: {data['commodity']}
-⚖️ Weight: {data['weight']} lbs
-📏 Miles: {data['miles']}
-🌡️ Temp: {data['temp']}
-
-**Shipment:**
-📍 Pickup: {data['pickup']} on {data['pickup_date']}
-📍 Delivery: {data['delivery']} on {data['delivery_date']}
-
-**Rate:**
-💰 Total Rate: ${data['total_rate']}
-
-**Special Notes:**
-ℹ️ Check for signing requirements & POD submission (72hrs)
-"""
-    return msg
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle PDF uploads"""
+async def handle_pdf(update, context):
     try:
-        file = await update.message.document.get_file()
-        file_path = f"/tmp/{file.file_unique_id}.pdf"
-        await file.download_to_drive(file_path)
+        await update.message.reply_text("📄 Converting...")
+        f = await update.message.document.get_file()
+        fp = os.path.join(TEMP_DIR, f"{f.file_unique_id}.pdf")
+        await f.download_to_drive(fp)
         
-        text = extract_from_pdf(file_path)
-        data = parse_rc(text)
-        msg = format_message(data)
+        txt = pdf_to_text_ocr(fp)
+        d = parse_rc(txt)
+        context.user_data["d"] = d
         
-        await update.message.reply_text(msg, parse_mode="Markdown")
-        os.remove(file_path)
+        kb = [[InlineKeyboardButton("✅ WITH", callback_data="yes"),
+               InlineKeyboardButton("❌ NO", callback_data="no")]]
         
+        await update.message.reply_text(f"{d['pro']}\n\n**Has RATE?**", 
+                                       reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        if os.path.exists(fp): os.remove(fp)
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+        await update.message.reply_text(f"❌ {str(e)}")
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle image uploads"""
+async def handle_photo(update, context):
     try:
-        file = await update.message.photo[-1].get_file()
-        file_path = f"/tmp/{file.file_unique_id}.jpg"
-        await file.download_to_drive(file_path)
+        await update.message.reply_text("📸 Scanning...")
+        f = await update.message.photo[-1].get_file()
+        fp = os.path.join(TEMP_DIR, f"{f.file_unique_id}.jpg")
+        await f.download_to_drive(fp)
         
-        text = extract_from_image(file_path)
-        data = parse_rc(text)
-        msg = format_message(data)
+        txt = extract_image_text(fp)
+        d = parse_rc(txt)
+        context.user_data["d"] = d
         
-        await update.message.reply_text(msg, parse_mode="Markdown")
-        os.remove(file_path)
+        kb = [[InlineKeyboardButton("✅ WITH", callback_data="yes"),
+               InlineKeyboardButton("❌ NO", callback_data="no")]]
         
+        await update.message.reply_text(f"{d['pro']}\n\n**Has RATE?**", 
+                                       reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        if os.path.exists(fp): os.remove(fp)
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+        await update.message.reply_text(f"❌ {str(e)}")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
-    await update.message.reply_text(
-        "🤖 **Rate Confirmation Bot**\n\n"
-        "Send me:\n"
-        "📄 PDF of rate confirmation\n"
-        "📸 Photo/screenshot of RC\n\n"
-        "I'll extract all the details!"
-    )
+async def start(update, context):
+    await update.message.reply_text("🤖 RC Bot Ready")
 
 def main():
+    print("🚀 Starting...")
     app = Application.builder().token(TOKEN).build()
-    
-    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CallbackQueryHandler(rate_response))
     app.add_handler(MessageHandler(filters.COMMAND, start))
-    
-    print("🤖 Bot running... Press Ctrl+C to stop")
+    print("✅ RUNNING\n")
     app.run_polling()
 
 if __name__ == "__main__":
