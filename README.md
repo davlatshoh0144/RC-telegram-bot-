@@ -15,7 +15,7 @@ A Telegram bot that extracts and processes rate confirmation data from PDFs/mess
 ## 🛠 Tech Stack
 - Python  
 - Telegram Bot API  
-- (aiogram / telebot — update based on what you used)
+- aiogram  
 
 ---
 
